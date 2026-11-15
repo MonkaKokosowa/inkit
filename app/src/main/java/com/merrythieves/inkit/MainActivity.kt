@@ -336,6 +336,8 @@ class MainActivity : AppCompatActivity() {
         popup.menu.add(0, 8, 7, "Import PDF")
         popup.menu.add(0, 9, 8, "Import image")
         popup.menu.add(0, 10, 9, "Import images (multiple)")
+        popup.menu.add(0, 11, 10, "-- View --")
+        popup.menu.add(0, 12, 11, "Redraw page")
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> confirmClear()
@@ -346,6 +348,7 @@ class MainActivity : AppCompatActivity() {
                 8 -> importManager.importPdf()
                 9 -> importManager.importImage()
                 10 -> importManager.importImages()
+                12 -> redrawCurrentPage()
             }
             true
         }
@@ -501,6 +504,21 @@ class MainActivity : AppCompatActivity() {
     private fun popPenDisable() {
         penDisableCount = (penDisableCount - 1).coerceAtLeast(0)
         if (penDisableCount == 0) ink.setOverlayEnabled(true)
+    }
+
+    private fun redrawCurrentPage() {
+        pushPenDisable()
+        val currentPage = notebookStore.getCurrentPage()
+        currentPage?.let { page ->
+            val w = ink.width
+            val h = ink.height
+            if (w > 0 && h > 0) {
+                val docHeight = h * ink.documentHeightFactor
+                val content = notebookStore.loadPageContent(page.id, w, docHeight)
+                ink.setDocBitmapWithContent(content, currentBackgroundIndex, scrollYReset = 0)
+            }
+        }
+        popPenDisable()
     }
 
     private fun schedulePersist() {
