@@ -1,5 +1,6 @@
 package com.merrythieves.inkit
 
+import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.Bitmap
@@ -8,6 +9,7 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
+import android.view.KeyEvent
 import android.view.View
 import android.widget.ImageButton
 import android.widget.LinearLayout
@@ -18,6 +20,9 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.inksdk.ink.InkDefaults
+import com.merrythieves.inkit.exporter.ExportManager
+import com.merrythieves.inkit.importer.ImportManager
+import com.merrythieves.inkit.store.NotebookStore
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -26,7 +31,7 @@ import java.util.concurrent.Executors
 class MainActivity : AppCompatActivity() {
 
     private lateinit var ink: InkSurfaceView
-    private lateinit var store: CanvasStore
+    private lateinit var notebookStore: NotebookStore
 
     private lateinit var txtPage: TextView
     private lateinit var btnPrev: ImageButton
@@ -43,72 +48,117 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scrollIndicator: View
 
     private var currentBackgroundIndex = 0
+    private var currentNotebookId: String? = null
 
     // Rainbow + greys
     private val colors = intArrayOf(
         Color.BLACK,
-        Color.parseColor("#404040"), // Dark grey
-        Color.parseColor("#808080"), // Medium grey
-        Color.parseColor("#C0C0C0"), // Light grey
+        Color.parseColor("#404040"),
+        Color.parseColor("#808080"),
+        Color.parseColor("#C0C0C0"),
         Color.RED,
-        Color.parseColor("#FF6600"), // Orange
-        Color.parseColor("#FFCC00"), // Yellow
-        Color.parseColor("#00CC00"), // Green
-        Color.parseColor("#00CCCC"), // Cyan
+        Color.parseColor("#FF6600"),
+        Color.parseColor("#FFCC00"),
+        Color.parseColor("#00CC00"),
+        Color.parseColor("#00CCCC"),
         Color.BLUE,
-        Color.parseColor("#6600CC"), // Purple
-        Color.parseColor("#CC00CC"), // Magenta
-        Color.parseColor("#1E7B1E")  // Dark green
+        Color.parseColor("#6600CC"),
+        Color.parseColor("#CC00CC"),
+        Color.parseColor("#1E7B1E")
     )
     private var activeColor: Int = Color.BLACK
 
-    /** Idle period after the last stroke before we encode + write the PNG.
-     *  Keeps disk I/O off the path of active writing. */
     private val saveIdleDelayMs = 2_500L
-
-    /** True once the current canvas's saved content has been loaded into the
-     *  view. Save attempts before this flag is set would persist a transient
-     *  blank docBitmap (e.g. one created by a surface recreate) over the
-     *  good on-disk state. */
     private var contentLoaded: Boolean = false
-
-    /** Nesting count of UI surfaces (popup menus, dialogs, palette) currently
-     *  occluding the canvas. The daemon dispatches pen events based on view
-     *  bounds, not Z-order, so without disabling its input these surfaces
-     *  would let pen taps draw on the canvas underneath. */
     private var penDisableCount: Int = 0
 
-    /** Single-threaded background pool for canvas saves. Min priority so the
-     *  compress pass can't compete with the daemon's binder thread. */
     private val saveExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "canvas-save").apply { priority = Thread.MIN_PRIORITY }
     }
     private val saveRunnable = Runnable { flushSaveAsync() }
 
-    private lateinit var exportLauncher: ActivityResultLauncher<Intent>
-    private lateinit var importLauncher: ActivityResultLauncher<Intent>
+    private lateinit var importPdfLauncher: ActivityResultLauncher<Intent>
+    private lateinit var importImageLauncher: ActivityResultLauncher<Intent>
+    private lateinit var importMultipleLauncher: ActivityResultLauncher<Intent>
+    private lateinit var exportPdfLauncher: ActivityResultLauncher<Intent>
+    private lateinit var exportImageLauncher: ActivityResultLauncher<Intent>
+    private lateinit var exportImagesLauncher: ActivityResultLauncher<Intent>
+
+    // Import Manager
+    private lateinit var importManager: ImportManager
+    private lateinit var exportManager: ExportManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        exportLauncher = registerForActivityResult(
-            ActivityResultContracts.StartActivityForResult()
-        ) { result ->
-            popPenDisable()
-            val uri = result.data?.data
-            if (result.resultCode == RESULT_OK && uri != null) handleExport(uri)
+        notebookStore = NotebookStore.getInstance(this)
+        
+        // Get current notebook from intent
+        currentNotebookId = intent.getStringExtra("NOTEBOOK_ID")
+        if (currentNotebookId == null) {
+            // If no notebook specified, use the current one from store
+            currentNotebookId = notebookStore.getCurrentNotebookId()
+            if (currentNotebookId == null) {
+                // Create a default notebook
+                val notebook = notebookStore.createNotebook(
+                    name = "Untitled",
+                    coverColor = Color.parseColor("#4285F4")
+                )
+                currentNotebookId = notebook.id
+                notebookStore.setCurrentNotebook(notebook.id)
+            }
         }
-        importLauncher = registerForActivityResult(
+        notebookStore.setCurrentNotebook(currentNotebookId!!)
+
+        // Register import launchers
+        importPdfLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult()
         ) { result ->
-            popPenDisable()
-            val uri = result.data?.data
-            if (result.resultCode == RESULT_OK && uri != null) handleImport(uri)
+            importManager.handleImportPdfResult(result)
+        }
+        importImageLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            importManager.handleImportImageResult(result)
+        }
+        importMultipleLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            importManager.handleImportImagesResult(result)
         }
 
-        store = CanvasStore(this)
-        store.ensureNonEmpty()
+        // Register export launchers
+        exportPdfLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            exportManager.handleExportPdfResult(result)
+        }
+        exportImageLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            exportManager.handleExportImageResult(result)
+        }
+        exportImagesLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            exportManager.handleExportImagesResult(result)
+        }
+
+        exportManager = ExportManager(
+            this,
+            exportPdfLauncher,
+            exportImageLauncher,
+            exportImagesLauncher
+        )
+        importManager = ImportManager(
+            this,
+            importPdfLauncher,
+            importImageLauncher,
+            importMultipleLauncher,
+            onImportComplete = { refreshAfterImport() }
+        )
+        importManager.initialize()
 
         ink = findViewById(R.id.inkSurface)
         txtPage = findViewById(R.id.txtPage)
@@ -128,7 +178,7 @@ class MainActivity : AppCompatActivity() {
         ink.touchEnabled = false
         ink.setStrokeStyle(InkDefaults.DEFAULT_STROKE_WIDTH_PX, activeColor)
 
-        btnPrev.setOnClickListener { goToPage(store.getCurrentIndex() - 1) }
+        btnPrev.setOnClickListener { goToPage(getCurrentPageIndex() - 1) }
         btnNext.setOnClickListener { goToPageOrCreateNew() }
         btnPen.setOnClickListener { selectPen() }
         btnEraser.setOnClickListener { selectEraser() }
@@ -140,8 +190,10 @@ class MainActivity : AppCompatActivity() {
         btnMore.setOnClickListener { showMoreMenu() }
         btnNew.setOnClickListener {
             cancelSaveAndFlush()
-            store.createNew(setCurrent = true, inheritBackgroundType = currentBackgroundIndex)
-            loadCurrentIntoView()
+            currentNotebookId?.let { notebookId ->
+                notebookStore.createPage(notebookId, inheritBackgroundType = currentBackgroundIndex)
+                loadCurrentIntoView()
+            }
         }
         btnUndo.setOnClickListener {
             if (ink.undo()) updateUndoButton()
@@ -149,21 +201,18 @@ class MainActivity : AppCompatActivity() {
         btnBackground.setOnClickListener { showBackgroundPicker() }
 
         ink.setPageNavListener { dir ->
-            val nextIdx = store.getCurrentIndex() + dir
-            if (nextIdx < store.size) {
+            val currentIndex = getCurrentPageIndex()
+            val nextIdx = currentIndex + dir
+            val pageCount = currentNotebookId?.let { notebookStore.getPageCount(it) } ?: 0
+            if (nextIdx >= 0 && nextIdx < pageCount) {
                 goToPage(nextIdx)
             } else if (dir > 0) {
-                // Swipe forward on last page creates new page
                 btnNew.performClick()
             }
         }
         ink.setScrollListener { y, max -> updateScrollIndicator(y, max) }
         ink.setDirtyListener { schedulePersist() }
         ink.setUndoListener { updateUndoButton() }
-        // If the surface is destroyed and recreated (e.g. brief backgrounding,
-        // config change), reload from disk in case the in-memory bitmap was
-        // lost. With InkSurfaceView's bitmaps now retained across the surface
-        // lifecycle this is mostly a safety net for process-death restoration.
         ink.setSurfaceReadyListener {
             if (!contentLoaded) loadCurrentIntoView()
         }
@@ -173,9 +222,24 @@ class MainActivity : AppCompatActivity() {
         updatePageLabel()
         updateUndoButton()
 
-        // Defer the first canvas load until the surface has dimensions, so
-        // the document bitmap is sized correctly for vertical scroll.
         ink.post { loadCurrentIntoView() }
+    }
+
+    // Handle hardware key presses (e.g., volume buttons on e-ink devices)
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (currentNotebookId != null) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_VOLUME_UP -> {
+                    goToPage(getCurrentPageIndex() - 1)
+                    return true
+                }
+                KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                    goToPageOrCreateNew()
+                    return true
+                }
+            }
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     override fun onPause() {
@@ -188,26 +252,41 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    private fun getCurrentPageIndex(): Int {
+        return currentNotebookId?.let { notebookStore.getPageIndex(notebookStore.getCurrentPageId() ?: "") } ?: 0
+    }
+
     private fun goToPage(index: Int) {
-        if (index < 0 || index >= store.size) return
+        if (index < 0) return
+        val currentNotebookId = currentNotebookId ?: return
+        val pageCount = notebookStore.getPageCount(currentNotebookId)
+        if (index >= pageCount) return
+        
         cancelSaveAndFlush()
-        // Save current page's background setting before leaving
-        store.setBackgroundType(store.getCurrentIndex(), currentBackgroundIndex)
-        store.setCurrent(index)
-        loadCurrentIntoView()
+        val pages = notebookStore.getPagesInNotebook(currentNotebookId)
+        if (index < pages.size) {
+            notebookStore.setCurrentPage(pages[index].id)
+            loadCurrentIntoView()
+        }
     }
 
     private fun goToPageOrCreateNew() {
-        val nextIdx = store.getCurrentIndex() + 1
-        if (nextIdx < store.size) {
-            goToPage(nextIdx)
+        val currentNotebookId = currentNotebookId ?: return
+        val currentIndex = getCurrentPageIndex()
+        val pageCount = notebookStore.getPageCount(currentNotebookId)
+        
+        if (currentIndex + 1 < pageCount) {
+            goToPage(currentIndex + 1)
         } else {
-            // On last page, create new page
             cancelSaveAndFlush()
-            store.setBackgroundType(store.getCurrentIndex(), currentBackgroundIndex)
-            store.createNew(setCurrent = true, inheritBackgroundType = currentBackgroundIndex)
+            notebookStore.createPage(currentNotebookId, inheritBackgroundType = currentBackgroundIndex)
             loadCurrentIntoView()
         }
+    }
+
+    private fun refreshAfterImport() {
+        loadCurrentIntoView()
+        updatePageLabel()
     }
 
     private fun loadCurrentIntoView() {
@@ -215,11 +294,22 @@ class MainActivity : AppCompatActivity() {
         val h = ink.height
         if (w <= 0 || h <= 0) return
         contentLoaded = false
+        
+        val currentPage = notebookStore.getCurrentPage()
+        if (currentPage == null) {
+            // No pages, create one
+            currentNotebookId?.let { notebookId ->
+                notebookStore.createPage(notebookId, inheritBackgroundType = currentBackgroundIndex)
+            }
+            contentLoaded = true
+            updatePageLabel()
+            return
+        }
+        
         val docHeight = h * ink.documentHeightFactor
-        // Load this page's background setting first
-        currentBackgroundIndex = store.getBackgroundType(store.getCurrentIndex())
-        // Load saved content
-        val content = store.loadContent(store.getCurrentIndex(), w, docHeight)
+        currentBackgroundIndex = currentPage.backgroundType
+        
+        val content = notebookStore.loadPageContent(currentPage.id, w, docHeight)
         ink.setDocBitmapWithContent(content, currentBackgroundIndex, scrollYReset = 0)
         updateToolHighlights()
         updatePageLabel()
@@ -237,15 +327,25 @@ class MainActivity : AppCompatActivity() {
     private fun showMoreMenu() {
         val popup = PopupMenu(this, btnMore)
         popup.menu.add(0, 1, 0, "Clear canvas")
-        popup.menu.add(0, 2, 1, "Delete canvas")
-        popup.menu.add(0, 3, 2, "Export notes…")
-        popup.menu.add(0, 4, 3, "Import notes…")
+        popup.menu.add(0, 2, 1, "Delete page")
+        popup.menu.add(0, 3, 2, "-- Export --")
+        popup.menu.add(0, 4, 3, "Export current page as PDF")
+        popup.menu.add(0, 5, 4, "Export current page as PNG")
+        popup.menu.add(0, 6, 5, "Export notebook as PDF")
+        popup.menu.add(0, 7, 6, "-- Import --")
+        popup.menu.add(0, 8, 7, "Import PDF")
+        popup.menu.add(0, 9, 8, "Import image")
+        popup.menu.add(0, 10, 9, "Import images (multiple)")
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> confirmClear()
                 2 -> confirmDelete()
-                3 -> startExport()
-                4 -> confirmImport()
+                4 -> exportManager.exportCurrentPageAsPdf()
+                5 -> exportManager.exportCurrentPageAsImage()
+                6 -> exportManager.exportCurrentNotebookAsPdf()
+                8 -> importManager.importPdf()
+                9 -> importManager.importImage()
+                10 -> importManager.importImages()
             }
             true
         }
@@ -254,65 +354,11 @@ class MainActivity : AppCompatActivity() {
         popup.show()
     }
 
-    private fun startExport() {
-        cancelSaveAndFlush()
-        val ts = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/zip"
-            putExtra(Intent.EXTRA_TITLE, "inkit-notes-$ts.zip")
-        }
-        pushPenDisable()
-        exportLauncher.launch(intent)
-    }
-
-    private fun confirmImport() {
-        pushPenDisable()
-        AlertDialog.Builder(this)
-            .setTitle("Import notes")
-            .setMessage("Importing will REPLACE all current canvases with the contents of the archive. Continue?")
-            .setNegativeButton("Cancel") { _, _ -> popPenDisable() }
-            .setPositiveButton("Choose file") { _, _ ->
-                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    type = "*/*"
-                    putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/zip", "application/octet-stream"))
-                }
-                importLauncher.launch(intent)
-            }
-            .setOnCancelListener { popPenDisable() }
-            .show()
-    }
-
-    private fun handleExport(dest: Uri) {
-        when (val r = NotesArchive.export(this, dest)) {
-            is NotesArchive.Result.Success ->
-                Toast.makeText(this, "Exported ${r.entries} files", Toast.LENGTH_SHORT).show()
-            is NotesArchive.Result.Failure ->
-                Toast.makeText(this, "Export failed: ${r.message}", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    private fun handleImport(src: Uri) {
-        cancelSaveAndFlush()
-        when (val r = NotesArchive.importArchive(this, src)) {
-            is NotesArchive.Result.Success -> {
-                store = CanvasStore(this)
-                store.ensureNonEmpty()
-                contentLoaded = false
-                loadCurrentIntoView()
-                Toast.makeText(this, "Imported ${r.entries} files", Toast.LENGTH_SHORT).show()
-            }
-            is NotesArchive.Result.Failure ->
-                Toast.makeText(this, "Import failed: ${r.message}", Toast.LENGTH_LONG).show()
-        }
-    }
-
     private fun confirmClear() {
         pushPenDisable()
         AlertDialog.Builder(this)
             .setTitle("Clear canvas")
-            .setMessage("Erase all ink on this canvas? This can't be undone.")
+            .setMessage("Erase all ink on this page? This can't be undone.")
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Clear") { _, _ ->
                 ink.clearCurrent()
@@ -323,21 +369,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun confirmDelete() {
-        if (store.size == 0) return
+        val currentNotebookId = currentNotebookId ?: return
+        if (notebookStore.getPageCount(currentNotebookId) == 0) return
+        
         pushPenDisable()
         AlertDialog.Builder(this)
-            .setTitle("Delete canvas")
-            .setMessage("Delete this canvas? This can't be undone.")
+            .setTitle("Delete page")
+            .setMessage("Delete this page? This can't be undone.")
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Delete") { _, _ ->
-                // Drop any pending debounced save without flushing — we're
-                // about to delete this canvas, so saving its current state
-                // would just orphan a file.
                 ink.removeCallbacks(saveRunnable)
-                val idx = store.getCurrentIndex()
-                val newIdx = store.delete(idx)
-                if (newIdx < 0) {
-                    store.createNew(setCurrent = true, inheritBackgroundType = currentBackgroundIndex)
+                val currentPageId = notebookStore.getCurrentPageId()
+                if (currentPageId != null) {
+                    notebookStore.deletePage(currentPageId)
+                }
+                // Load first page or create new if empty
+                val pages = notebookStore.getPagesInNotebook(currentNotebookId)
+                if (pages.isNotEmpty()) {
+                    notebookStore.setCurrentPage(pages[0].id)
+                } else {
+                    notebookStore.createPage(currentNotebookId, inheritBackgroundType = currentBackgroundIndex)
                 }
                 loadCurrentIntoView()
             }
@@ -397,7 +448,6 @@ class MainActivity : AppCompatActivity() {
         btnEraser.background = if (!penActive) getDrawable(R.drawable.bg_tool_selected) else null
         btnFinger.setImageResource(if (ink.touchEnabled) R.drawable.ic_touch_enabled else R.drawable.ic_touch_disabled)
         btnFinger.background = if (ink.touchEnabled) getDrawable(R.drawable.bg_tool_selected) else null
-        // Use the color icon's tint as a hint of the active color.
         btnColor.imageTintList = android.content.res.ColorStateList.valueOf(activeColor)
         btnBackground.background = null
     }
@@ -409,7 +459,10 @@ class MainActivity : AppCompatActivity() {
             .setTitle("Background")
             .setSingleChoiceItems(options, currentBackgroundIndex) { dialog, which ->
                 currentBackgroundIndex = which
-                store.setBackgroundType(store.getCurrentIndex(), which)
+                val currentPage = notebookStore.getCurrentPage()
+                currentPage?.let { page ->
+                    notebookStore.savePageMetadata(page.copy(backgroundType = which))
+                }
                 ink.setBackground(which)
                 updateToolHighlights()
                 dialog.dismiss()
@@ -419,11 +472,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePageLabel() {
-        val total = store.size
-        val current = if (total > 0) store.getCurrentIndex() + 1 else 0
+        val currentNotebookId = currentNotebookId ?: return
+        val total = notebookStore.getPageCount(currentNotebookId)
+        val currentIndex = getCurrentPageIndex()
+        val current = if (total > 0) currentIndex + 1 else 0
         txtPage.text = "$current/$total"
-        btnPrev.isEnabled = store.getCurrentIndex() > 0
-        // Next button always enabled (creates new page if on last)
+        btnPrev.isEnabled = currentIndex > 0
         btnNext.isEnabled = true
     }
 
@@ -449,50 +503,44 @@ class MainActivity : AppCompatActivity() {
         if (penDisableCount == 0) ink.setOverlayEnabled(true)
     }
 
-    /** Reset the idle timer. Fired by InkSurfaceView every time a stroke ends. */
     private fun schedulePersist() {
         ink.removeCallbacks(saveRunnable)
         ink.postDelayed(saveRunnable, saveIdleDelayMs)
     }
 
-    /** Cancel a pending debounced save and immediately enqueue one (for page
-     *  changes, clear, new, and lifecycle pause). */
     private fun cancelSaveAndFlush() {
         ink.removeCallbacks(saveRunnable)
         flushSaveAsync()
     }
 
-    /** Snapshot the doc bitmap on the main thread (cheap memcpy), hand the
-     *  copy to the worker thread for PNG encoding + atomic write. */
     private fun flushSaveAsync() {
         if (!contentLoaded) {
-            Log.i(TAG, "skip save — current canvas not yet loaded from disk")
+            Log.i(TAG, "skip save — current page not yet loaded from disk")
             return
         }
-        val idx = store.getCurrentIndex()
-        // Capture the canvas id on the main thread so the bg write can't be
-        // redirected onto a different canvas if the index is mutated (delete,
-        // createNew, page switch) before the worker thread picks the task up.
-        val id = store.getMeta(idx).id
+        val currentPageId = notebookStore.getCurrentPageId() ?: return
+        val w = ink.width
+        val h = ink.height
+        if (w <= 0 || h <= 0) return
+        
         val bmp = ink.peekDocBitmap() ?: return
-        Log.i(TAG, "flushSaveAsync: id=$id docId=${System.identityHashCode(bmp)}")
+        
         val snapshot: Bitmap = try {
             bmp.copy(Bitmap.Config.ARGB_8888, false)
         } catch (t: Throwable) {
             Log.w(TAG, "snapshot failed: ${t.message}")
             return
         }
+        
         saveExecutor.execute {
             try {
-                store.saveBitmap(id, snapshot)
-                Log.i(TAG, "flushSaveAsync: wrote $id to disk")
+                notebookStore.savePageContent(currentPageId, snapshot)
+                Log.i(TAG, "flushSaveAsync: wrote $currentPageId to disk")
             } finally {
                 snapshot.recycle()
             }
         }
     }
-
-    private fun parseColor(hex: String): Int = Color.parseColor(hex)
 
     companion object { private const val TAG = "MainActivity" }
 }
